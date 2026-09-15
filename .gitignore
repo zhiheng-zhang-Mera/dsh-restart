@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output. `lib/` is generated from `src/` by `npm run build` and by the
+# `prepack` hook, so it is intentionally not tracked. Consumers installing from
+# npm or from a tarball receive the built directory inside the package.
+lib/
+
+# Logs and local scratch state
+*.log
+npm-debug.log*
+.npm/
+.cache/
+tmp/
+temp/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Runtime state when a developer points the plugin at the checkout instead of the
+# default under $DSH_HOME. These are the exact artifacts the supervisor and the
+# plugin exchange, and none of them belongs in version control.
+.dsh-restart/
+ticket.json
+heartbeat.json
+ledger.json
+supervisor.log
+restart-attempts.jsonl
+restart-attempts.jsonl.*.bak

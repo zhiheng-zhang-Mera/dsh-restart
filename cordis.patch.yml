@@ -1,0 +1,201 @@
+# The dsh-restart bundle patch.
+#
+# This is the layer the package contributes to a profile's composed configuration.
+# `dsh plugin --profile <name> add dsh-restart` adds the package to
+# `dsh.profile.bundles`, and the harness reads the file named by this package's
+# `package.json` -> `dsh.bundle.patch`, which is this one.
+#
+# The row below inserts exactly one plugin. Its `config` is the plugin's
+# configuration document. Every leaf is optional: the document is deep-merged over
+# `DEFAULT_CONFIG` in `src/shared/config.ts`, and anything omitted keeps the default
+# value written here. `resolveConfig()` then validates the result and refuses a
+# document it could not enforce, naming the offending dotted path.
+#
+# Values below are the shipped defaults, so this file changes nothing about the
+# plugin's behaviour until someone edits it. Each key is preceded by what it does
+# and what happens if it is changed.
+#
+# To override a nested key, restate the whole nested object: partial nested objects
+# are merged by the plugin's own resolver, but a profile-level override of this row
+# is a different layer, and restating the full object is correct under either
+# reading.
+
+- insert:
+    - id: restart
+      name: 'dsh-restart'
+      config:
+        # The master switch for restart *execution*. While this is `false` every
+        # request is refused with `DISABLED`; the plugin still loads, still
+        # registers its tools, and still reports status. Risk of changing: setting
+        # it to `false` silently removes the ability to restart at all, which is
+        # exactly what an already-degraded host may be asking for, so prefer
+        # `applicationRestart.enabled` for a narrower switch.
+        enabled: true
+
+        # Application-level restart: DS-Hns exits gracefully and the supervisor
+        # relaunches it. This is the normal, cheap, recoverable restart.
+        applicationRestart:
+          # Whether application restarts may happen at all. Risk: turning this off
+          # leaves no automatic recovery path for the application; turning it on is
+          # the intended default because the process is expected to come back.
+          enabled: true
+          # Hard lower bound between two application restarts. A request that
+          # arrives earlier is refused with `COOLDOWN_ACTIVE` rather than queued.
+          # Risk: a small value permits a restart storm; a large value makes an
+          # operator wait through an incident. The bound is enforced in the process
+          # that accepted the previous restart, so it does not survive a restart.
+          minIntervalMs: 1200000
+
+        # System-level restart: an operating-system reboot. Off by default, and
+        # gated again by `allowSystemReboot` and by the request's own
+        # acknowledgement. Risk: enabling it lets a request end every other
+        # program on the machine, not just DS-Hns.
+        systemRestart:
+          # Whether the system mode may be used at all. Risk: this is the first of
+          # three independent gates, and it is the one to leave off until a
+          # deployment genuinely needs a reboot.
+          enabled: false
+          # Hard lower bound between two system restarts; longer than the
+          # application bound because the recovery cost is far higher. Risk: too
+          # short and a failing machine can be rebooted repeatedly; too long and a
+          # genuine second reboot is refused.
+          minIntervalMs: 3600000
+
+        # Sources allowed to submit requests. A request from any other source is
+        # refused with `UNKNOWN_SOURCE`, because "something on this machine asked me
+        # to reboot it" is not an authorization. Risk: adding a source grants it the
+        # ability to end the process; the list must not be empty, and
+        # `resolveConfig()` refuses an empty one.
+        allowedSources:
+          - dsh-health-scheduler
+          - dsh-cli
+          - operator
+
+        # Priorities accepted at all. This is a vocabulary filter, not a
+        # dispatching rule: priority never bypasses a check. Risk: narrowing the
+        # list makes a requester's request fail with `INVALID_REQUEST` instead of
+        # merely being deprioritized.
+        allowedPriorities:
+          - low
+          - normal
+          - high
+          - emergency
+
+        # Whether `mode: "system"` may ever be performed, on top of
+        # `systemRestart.enabled`. Risk: with this true and the mode enabled, a
+        # request that also acknowledges the reboot is authorized to reboot the
+        # machine, so this is the switch to audit first.
+        allowSystemReboot: false
+
+        # The self-imposed safety bounds. These are the values that decide whether a
+        # restart is safe to execute, not whether one is wanted.
+        safety:
+          # Whether a request that asks for a checkpoint must get one. With this
+          # true, an unsafe, incomplete, thrown, timed-out or unbound checkpoint
+          # aborts the restart. Risk: setting it to `false` lets a restart proceed
+          # without any confirmation that the harness reached a safe point, which is
+          # the one behaviour the design forbids outright.
+          checkpointRequired: true
+          # Whether replaying a `requestId` returns the previous answer instead of
+          # acting again. Risk: turning it off makes a retrying requester able to
+          # submit a second restart with the same id, so the lock and cooldown
+          # become the only defences against a duplicate.
+          duplicateSuppression: true
+          # Unclean starts inside the window that trip the breaker. Risk: a low
+          # limit sends a machine with one flaky crash into safe mode; a high limit
+          # lets a genuinely crash-looping process be relaunched more times.
+          crashLoopLimit: 3
+          # Breaker window. The window is rolling, so old crashes stop counting.
+          # Risk: a short window lets a slow crash loop evade the breaker; a long
+          # window makes unrelated crashes accumulate into a trip.
+          crashLoopWindowMs: 600000
+          # Whether tripping the breaker also enters safe mode. Risk: with this
+          # false the breaker still refuses to relaunch past the limit, but no
+          # `safeMode` flag is recorded, so an operator has less to go on.
+          safeModeOnLoop: true
+          # How long the harness is given to act on a graceful shutdown request.
+          # It is also the budget for the checkpoint call, because a checkpoint that
+          # has not answered by the time the process must stop is not a checkpoint.
+          # Risk: this is a budget, not a deadline the plugin enforces by killing
+          # anything — see `docs/failure-modes.md` (case 4).
+          shutdownTimeoutMs: 90000
+          # Whether a timed-out shutdown may be terminated by force. Risk: leaving
+          # this false means a hung shutdown is waited on rather than killed, which
+          # is the safe default; setting it true is a licence to kill a process that
+          # may still be writing. No code path in this release consults it.
+          allowForceTerminate: false
+          # Whether a restart may be attempted with no supervisor heartbeat. Off by
+          # default: without a supervisor, exiting the process is not a restart, it
+          # is a shutdown, and an unhealthy app that never comes back is worse than
+          # an unhealthy app that is still running. Risk: setting it true converts
+          # every accepted request into a probable outage.
+          allowRestartWithoutSupervisor: false
+
+        # Supervisor timing and wiring. The supervisor is a separate process; these
+        # values are read by both sides.
+        supervisor:
+          # Milliseconds between supervisor heartbeats. Risk: a very long interval
+          # makes the plugin declare the supervisor absent between beats.
+          heartbeatIntervalMs: 5000
+          # Heartbeat age after which the supervisor counts as absent. Must exceed
+          # `heartbeatIntervalMs` or `resolveConfig()` refuses the document. Risk: a
+          # short timeout makes a busy machine refuse legitimate restarts.
+          heartbeatTimeoutMs: 30000
+          # How long the supervisor waits for a relaunched pid to be alive before
+          # counting the start as unclean. Must be at least `heartbeatIntervalMs`.
+          # Risk: too short and a slow-but-healthy start is counted against the
+          # breaker.
+          relaunchTimeoutMs: 90000
+          # The command the supervisor runs to relaunch DS-Hns. `null` means "reuse
+          # the supervisor's own argv", which is correct when the supervisor is
+          # started with an explicit `-- <launch command>`. Risk: a wrong value here
+          # relaunches the wrong program, or nothing at all.
+          launchCommand: null
+          # Extra arguments appended to the relaunch command. Risk: appended
+          # verbatim, so a stale argument changes how the harness starts.
+          launchArgs: []
+          # Working directory for the relaunch, or `null` for the supervisor's own.
+          # Risk: a relative profile path resolves somewhere unexpected.
+          launchCwd: null
+          # Milliseconds between PID polls while waiting for the exit. Risk: a very
+          # small value makes the supervisor poll the process list constantly; a
+          # large value delays the relaunch after a clean exit.
+          pollIntervalMs: 1000
+          # How long a pending ticket stays valid before the supervisor voids it.
+          # Risk: too short and a supervisor that starts late ignores a legitimate
+          # ticket; too long and an old ticket can be honoured after the fact.
+          ticketTtlMs: 600000
+          # Whether the supervisor runs detached from the plugin process. It must
+          # outlive the process it watches. Risk: setting it false makes the
+          # supervisor a child that dies with its parent, which defeats the point.
+          detach: true
+
+        # Where durable state lives.
+        storage:
+          # Directory override for the audit log; `null` means "the same directory
+          # as the ticket, heartbeat and ledger". Risk: pointing it at a temporary
+          # directory loses the incident trail; pointing it at a read-only path
+          # makes audit writes fail (they are reported, never thrown).
+          directory: null
+          # Maximum audit log size before it rotates to a `.bak` file. Risk: a large
+          # value grows an unattended machine's disk usage; a small value rotates
+          # often and scatters the trail.
+          maxLogBytes: 4194304
+          # How many attempts the status call keeps in memory. Risk: only affects
+          # what `restart_status` shows; the on-disk log keeps more.
+          maxRecentAttempts: 25
+
+        # Reason codes accepted without complaint. An unknown code is logged, not
+        # refused: rejecting an unknown reason would make a newer requester unable
+        # to ask for a restart at all. Risk: adding codes weakens nothing; this list
+        # is documentation for operators, not an authorization list.
+        knownReasonCodes:
+          - RUNTIME_PRESSURE
+          - SYSTEM_PRESSURE
+          - MEMORY_LEAK
+          - THERMAL_STRESS
+          - UI_DEGRADATION
+          - COMPUTER_USE_STALL
+          - SCHEDULED_MAINTENANCE
+          - OPERATOR_REQUEST
+          - TEST

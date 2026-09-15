@@ -218,16 +218,34 @@ describe('repository hygiene', () => {
     }
   })
 
-  it('does not import the health scheduler or any health vocabulary', () => {
+  it('does not import the health scheduler, and reaches it only through its own bridge', () => {
     const files = [
       'lib/index.js',
       'lib/plugin/restart-manager.js',
       'lib/plugin/request-validator.js',
+      'lib/plugin/health-scheduler-bridge.js',
       'lib/supervisor/index.js',
     ]
     for (const file of files) {
       const text = readFileSync(join(root, file), 'utf8')
-      assert.equal(text.includes('health-scheduler'), false, `${file} must not depend on the health plugin`)
+      // No runtime dependency on the sibling *package*: the two repositories stay
+      // independently installable, which is the property the split exists to preserve.
+      assert.equal(
+        /from\s+['"]dsh-health-scheduler/.test(text),
+        false,
+        `${file} must not import the health scheduler package`,
+      )
+      assert.equal(
+        /require\(\s*['"]dsh-health-scheduler/.test(text),
+        false,
+        `${file} must not require the health scheduler package`,
+      )
     }
+
+    // The one place the name is allowed to appear is the bridge, because the bridge is
+    // the seam: it exists so the health scheduler has something to find.
+    const bridge = readFileSync(join(root, 'lib/plugin/health-scheduler-bridge.js'), 'utf8')
+    assert.match(bridge, /healthScheduler/)
+    assert.match(bridge, /capability/)
   })
 })

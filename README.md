@@ -2,6 +2,10 @@
 
 **Safe restart execution for DeepSeek Harness — it decides *how* to restart safely, never *whether* one is warranted.**
 
+On load it publishes its restart adapter on the harness context as `ctx.healthScheduler`,
+which is where [`dsh-health-scheduler`](https://github.com/zhiheng-zhang-Mera/dsh-health-scheduler)
+looks for it — so a profile that lists both bundles connects without a glue script.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.11.0-brightgreen.svg)](package.json)
 [![DSH compatibility](https://img.shields.io/badge/DSH-%40deepseek--ai%2Fcordis%20%5E4.0.1-informational.svg)](package.json)

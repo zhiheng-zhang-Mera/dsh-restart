@@ -24,6 +24,8 @@ import { FunctionCheckpointPort } from '../lib/plugin/ports.js'
 import { RestartAuditLog } from '../lib/plugin/audit.js'
 import { TicketStore } from '../lib/plugin/ticket-store.js'
 import { RestartManager } from '../lib/plugin/restart-manager.js'
+import { createHealthSchedulerBridge } from '../lib/plugin/health-scheduler-bridge.js'
+import { applyRestart } from '../lib/plugin/index.js'
 import { T0 } from './helpers/rig.js'
 
 // Windows needs a real file URL before an absolute path can be imported, and the
@@ -32,15 +34,42 @@ const siblingPath = join(process.cwd(), '..', 'dsh-health-scheduler', 'lib', 'in
 const sibling = pathToFileURL(siblingPath).href
 const hasSibling = existsSync(siblingPath)
 
-/** The bridge the health scheduler's README documents, built on the real manager. */
+/**
+ * The bridge this plugin publishes, taken from this plugin's own export.
+ *
+ * The first version of this file hand-rolled the adapter instead, which is precisely why
+ * it passed while the two plugins still could not talk to each other: a hand-written
+ * bridge tests the shape both sides agree on, and the exported one tests the product.
+ */
 function buildRestartAdapter(manager) {
-  return {
-    id: 'dsh-restart',
-    capability: 'available',
-    requestApplicationRestart: (request) => manager.requestApplicationRestart(request),
-    requestSystemRestart: (request) => manager.requestSystemRestart(request),
-    cancelPendingRestart: (requestId) => manager.cancelPendingRestart(requestId),
+  return createHealthSchedulerBridge(manager)
+}
+
+/** A fake harness context, enough for both plugins' `apply`. */
+function fakeContext() {
+  const tools = new Map()
+  const logs = []
+  const context = {
+    logger: {
+      debug: (message) => logs.push(['debug', message]),
+      info: (message) => logs.push(['info', message]),
+      warn: (message) => logs.push(['warn', message]),
+      error: (message) => logs.push(['error', message]),
+    },
+    tools: {
+      register(definition) {
+        tools.set(definition.name, definition)
+        return () => tools.delete(definition.name)
+      },
+    },
+    settings: {
+      register(ns, schema, registerOptions) {
+        context.registeredSettings = { ns, schema, registerOptions }
+        return { get: () => registerOptions.base }
+      },
+    },
   }
+  return { context, tools, logs }
 }
 
 /** A restart manager whose checkpoint answers with `checkpoint`. */
@@ -166,6 +195,132 @@ async function driveOneRestartRequest(health, adapter) {
 }
 
 describe('health scheduler to restart plugin', { skip: hasSibling ? false : 'sibling checkout not present' }, () => {
+  it('publishes its adapter where the health scheduler actually looks, and it is accepted', async () => {
+    const health = await import(sibling)
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-cross-publish-'))
+    try {
+      // 1. The real plugin entry point runs against a real context.
+      const { context, logs } = fakeContext()
+      const applied = applyRestart(
+        context,
+        { allowedSources: ['dsh-health-scheduler', 'operator'] },
+        { resolveConfig, tryResolveConfig: (o) => ({ config: resolveConfig(o), error: null }) },
+        {
+          stateDirectory: directory,
+          checkpoint: new FunctionCheckpointPort({
+            prepare: () => ({
+              safe: true,
+              reason: 'idle',
+              checkpointId: 'ck-published',
+              resumeToken: 'rs-published',
+              completed: true,
+              detail: 'the kernel reports an idle safe point',
+            }),
+          }),
+          lifecycle: { requestShutdown: () => true },
+          systemShutdown: null,
+          // One clock for the whole test, so the heartbeat written below is fresh
+          // relative to the manager's own sense of now rather than the wall clock.
+          now: () => T0,
+        },
+      )
+
+      // 2. It published the bridge on the context, which is the only place the health
+      //    scheduler looks. This assertion is the one the first version of this file
+      //    was missing: it had a hand-written adapter and never checked the wire.
+      assert.ok(context.healthScheduler !== undefined, 'the restart plugin must publish ctx.healthScheduler')
+      assert.equal(context.healthScheduler.capability, 'available')
+      assert.equal(typeof context.healthScheduler.requestApplicationRestart, 'function')
+      assert.ok(
+        logs.some(([level, message]) => level === 'info' && message.includes('published its restart adapter')),
+        `expected a publication log, saw: ${logs.map(([l, m]) => `${l}:${m}`).join(' | ')}`,
+      )
+
+      // 3. A second context is what a real profile composes: both plugins in one tree.
+      //    The health scheduler reads the published adapter rather than falling back.
+      const composed = { ...fakeContext().context, healthScheduler: context.healthScheduler }
+      const scheduler = new health.HealthScheduler({
+        config: health.resolveConfig({ disabledProviders: ['hardware'] }),
+        restart: composed.healthScheduler,
+        workerControl: {
+          id: 'noop',
+          capability: 'available',
+          setConcurrencyLimit: async () => {},
+          pauseNewWorkers: async () => {},
+          resumeNormalConcurrency: async () => {},
+          currentConcurrencyLimit: () => null,
+        },
+        stateDirectory: null,
+      })
+      assert.notEqual(
+        scheduler.constructor.name,
+        'UnavailableRestartAdapter',
+        'the scheduler must not have fallen back to the unavailable adapter',
+      )
+      assert.equal(composed.healthScheduler.capability, 'available')
+
+      // 4. And the round trip works: a request through the published adapter lands in
+      //    the restart plugin's ticket.
+      applied.store.writeHeartbeat({
+        schemaVersion: 1,
+        supervisorPid: 999,
+        watchedPid: 4242,
+        state: 'MONITORING',
+        timestamp: new Date(T0).toISOString(),
+        sequence: 1,
+      })
+      const response = await composed.healthScheduler.requestApplicationRestart({
+        requestId: 'hs-published-1',
+        source: 'dsh-health-scheduler',
+        mode: 'application',
+        reasonCode: 'RUNTIME_PRESSURE',
+        reasonSummary: 'published bridge round trip',
+        checkpointRequired: true,
+        priority: 'normal',
+      })
+      assert.equal(response.accepted, true, `refused: ${JSON.stringify(response)}`)
+      const ticket = applied.store.readTicket(T0).ticket
+      assert.ok(ticket !== null, 'the round trip must leave a ticket')
+      assert.equal(ticket.checkpointId, 'ck-published')
+      assert.equal(ticket.requestId, 'hs-published-1')
+      applied.dispose()
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('reports an unusable configuration as unavailable rather than as available', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-cross-cap-'))
+    try {
+      const { store, manager } = buildManager(directory, {
+        safe: true,
+        reason: 'idle',
+        checkpointId: null,
+        resumeToken: null,
+        completed: true,
+        detail: 'ok',
+      })
+      assert.equal(createHealthSchedulerBridge(manager).capability, 'available')
+
+      // A manager with every restart mode off can accept nothing, so it must not claim
+      // availability: the health scheduler would raise requests guaranteed to fail.
+      const disabled = new RestartManager({
+        config: resolveConfig({ applicationRestart: { enabled: false } }),
+        ports: {
+          checkpoint: new FunctionCheckpointPort({ prepare: () => ({ safe: true, reason: 'idle', checkpointId: null, resumeToken: null, completed: true, detail: 'ok' }) }),
+          shutdown: { id: 's', requestShutdown: () => true },
+          systemShutdown: null,
+        },
+        store,
+        audit: new RestartAuditLog({ directory, maxBytes: 1024, maxRecords: 5 }),
+        pid: 1,
+      })
+      assert.equal(createHealthSchedulerBridge(disabled).capability, 'unavailable')
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('accepts the request the health scheduler builds, field for field', async () => {
     const health = await import(sibling)
     const directory = mkdtempSync(join(tmpdir(), 'dsh-cross-'))

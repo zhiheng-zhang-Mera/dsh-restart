@@ -56,6 +56,16 @@ export interface HarnessContextLike {
    * plugin prefers `$DSH_HOME` and falls back to this.
    */
   readonly stateDirectory?: string
+  /**
+   * Where this plugin publishes its restart capability for other plugins to use.
+   *
+   * `dsh-health-scheduler` reads an object of this name off the context and uses it as
+   * its `RestartAdapter` when it structurally matches. Publishing here is what turns
+   * "the restart plugin is installed" into "restart decisions can actually be carried
+   * out"; when the field cannot be written, the health scheduler falls back to its
+   * unavailable adapter and reports `restart_capability_unavailable`.
+   */
+  healthScheduler?: unknown
   effect?(callback: () => void | (() => void)): void
 }
 

@@ -713,6 +713,23 @@ export class RestartManager {
     return this.store.readLedger().safeMode
   }
 
+  /**
+   * Whether the health scheduler should consider this manager usable.
+   *
+   * Derived rather than asserted: a manager whose configuration disables every restart
+   * mode can accept a request but can never carry one out, so reporting `available`
+   * would make the health scheduler raise requests that are guaranteed to be refused.
+   * `unavailable` makes it downgrade its own decision and say why, which is the honest
+   * outcome and the one an operator can act on.
+   */
+  get capabilityForHealthScheduler(): 'available' | 'unavailable' | 'failed' {
+    if (!this.config.enabled) return 'unavailable'
+    const anyMode =
+      this.config.applicationRestart.enabled ||
+      (this.config.systemRestart.enabled && this.config.allowSystemReboot && this.ports.systemShutdown !== null)
+    return anyMode ? 'available' : 'unavailable'
+  }
+
   private supervisorView(nowMs: number): SupervisorPresence {
     const heartbeat = this.store.readHeartbeat()
     const age = this.store.heartbeatAgeMs(nowMs)

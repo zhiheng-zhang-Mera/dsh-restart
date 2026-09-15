@@ -19,6 +19,7 @@ import { RestartAuditLog } from './audit.js'
 import { TicketStore } from './ticket-store.js'
 import { RestartManager } from './restart-manager.js'
 import { UnboundCheckpointPort } from './checkpoint-gate.js'
+import { createHealthSchedulerBridge } from './health-scheduler-bridge.js'
 import { HostShutdownPort, RecordingLifecycle, WindowsSystemShutdownPort, type HostLifecycle } from './ports.js'
 import type { CheckpointPort, ShutdownPort, SystemShutdownPort } from '../shared/types.js'
 import type { RestartResponse, RestartStatus } from '../shared/protocol.js'
@@ -124,6 +125,29 @@ export function applyRestart(
     log.warn(`dsh-restart: ${reconciled.detail}`)
   }
 
+  // Publish the bridge the health scheduler reads. Without this the two plugins each
+  // work but never connect: the health scheduler silently falls back to its unavailable
+  // adapter and every restart decision is downgraded with
+  // `restart_capability_unavailable`, which looks like a policy choice rather than a
+  // missing wire.
+  const bridge = createHealthSchedulerBridge(manager)
+  let published = false
+  try {
+    ctx.healthScheduler = bridge
+    published = true
+  } catch (error) {
+    log.warn(
+      `dsh-restart: could not publish the restart adapter on the context (${(error as Error).message}); ` +
+        'dsh-health-scheduler will report the restart capability as unavailable',
+    )
+  }
+
+  if (published) {
+    log.info(
+      `dsh-restart: published its restart adapter as ctx.healthScheduler (capability ${bridge.capability}), so dsh-health-scheduler can request restarts`,
+    )
+  }
+
   const toolNames = ctx.tools === undefined ? [] : registerTools(ctx, manager, config, log)
   if (ctx.tools === undefined) {
     log.warn('dsh-restart: no tool runtime in this profile; restart control is available through the plugin API only')
@@ -131,7 +155,7 @@ export function applyRestart(
   registerSettings(ctx, config, deps, manager, log)
 
   log.info(
-    `dsh-restart: ready (application=${config.applicationRestart.enabled}, system=${config.systemRestart.enabled && config.allowSystemReboot}, state=${directory})`,
+    `dsh-restart: ready (application=${config.applicationRestart.enabled}, system=${config.systemRestart.enabled && config.allowSystemReboot}, adapter=${published ? `published (${bridge.capability})` : 'not published'}, state=${directory})`,
   )
 
   const dispose = (): void => {

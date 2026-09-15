@@ -55,6 +55,12 @@ export type {
   ValidationResult,
 } from './shared/types.js'
 export { RestartManager } from './plugin/restart-manager.js'
+export { createHealthSchedulerBridge } from './plugin/health-scheduler-bridge.js'
+export type {
+  HealthSchedulerBridge,
+  HealthSchedulerRestartAdapter,
+  RestartRequestLike,
+} from './plugin/health-scheduler-bridge.js'
 export type { RestartManagerOptions, RestartManagerPorts } from './plugin/restart-manager.js'
 export { RestartLock } from './plugin/restart-lock.js'
 export { CheckpointGate, UnboundCheckpointPort } from './plugin/checkpoint-gate.js'

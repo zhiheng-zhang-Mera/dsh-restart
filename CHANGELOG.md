@@ -10,7 +10,42 @@ contracts separately from the package version; see
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`createHealthSchedulerBridge()`, published on `ctx.healthScheduler`.** The two
+  interfaces were designed independently and do not line up by accident: the health
+  scheduler requires a `capability` field and `RestartManager` has none, so handing a
+  manager over directly was rejected by a structural check and the health scheduler
+  silently fell back to its unavailable adapter. The bridge derives the capability from the
+  configuration instead of asserting it, so a manager that cannot carry out any restart
+  reports `unavailable` rather than accepting requests it would refuse.
+
+### Fixed
+
+- **A system restart performs a reboot.** It called the host shutdown port, which is the
+  application path: the machine was never rebooted and a supervisor relaunched the app
+  exactly as for any other ticket. It now calls the system-shutdown port, and a machine
+  with no such port refuses the request instead of quietly downgrading it.
+- **`WAITING_FOR_EXIT` has a deadline, and a hung shutdown is recorded.** Past
+  `safety.shutdownTimeoutMs` the restart is abandoned and reported; with
+  `allowForceTerminate` on and a `ProcessTerminator` bound, the process is ended instead
+  and the restart is recorded as dirty. The shipped supervisor binds a terminator only when
+  that setting is on.
+- **Relaunch retries are paced** by a doubling backoff
+  (`supervisor.relaunchBackoffMs` / `relaunchBackoffMaxMs`) on top of the crash-loop
+  breaker.
+- **`acknowledgeResume` is called after a verified relaunch**, so the harness learns its
+  checkpoint was consumed.
+- **The supervisor ledger's safe mode is bridged into the plugin**, so a crash loop the
+  supervisor discovered is visible to the process that keeps asking for restarts.
+- **An accepted restart is written to the audit log before the response returns.**
+- **The four PowerShell scripts resolve their own repository root after the param block**,
+  because `$PSScriptRoot` is not populated when a `param()` default is evaluated under
+  `-File`; they also declare `#Requires -Version 5.1`, since nothing in them needs 7.
+- **`bin/supervisor.mjs` actually runs.** Its `isMain` check compared a hand-built
+  `file://D:/...` against the real `file:///D:/...`, so the script exited 0 having done
+  nothing; and because every library timer is `unref`'d, a bare `run()` drained the event
+  loop after a single tick.
 
 ## [0.1.0] - 2026-06-01
 

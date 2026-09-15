@@ -61,7 +61,7 @@ warranted.
   each supporting `-WhatIf`, each ending in an explicit summary and a non-zero exit on
   failure.
 - **Artifact check** — `scripts/verify-artifacts.mjs`, wired to `npm run verify:artifacts`.
-- **Test suite** — 156 tests across 25 suites in `tests/`, driving the real classes through
+- **Test suite** — 158 tests across 25 suites in `tests/`, driving the real classes through
   injected seams.
 - **Documentation** — this changelog, `README.md` and `README.zh.md`, `docs/architecture.md`,
   `docs/protocol.md`, `docs/failure-modes.md`, `docs/acceptance.md`, `docs/operations.md`,

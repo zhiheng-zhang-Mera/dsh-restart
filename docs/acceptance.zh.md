@@ -22,7 +22,7 @@ node bin/supervisor.mjs --help
 node --test --test-name-pattern "safe mode" tests/supervisor.test.js
 ```
 
-测试套件由五个文件组成：`validation.test.js`（请求形状、请求策略、锁、票据）、
+测试套件由六个文件组成：`validation.test.js`（请求形状、请求策略、锁、票据）、
 `manager.test.js`（pipeline、检查点门控、重复抑制、冷却、系统门控、取消、reconciliation、
 breaker 集成、supervisor 存在性、状态、审计日志）、`supervisor.test.js`（存活探针、
 breaker、启动命令推导、状态机、运行循环）、`plugin.test.js`（插件导出、`applyRestart`、

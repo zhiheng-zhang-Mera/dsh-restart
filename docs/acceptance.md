@@ -24,19 +24,31 @@ node bin/supervisor.mjs --help
 node --test --test-name-pattern "safe mode" tests/supervisor.test.js
 ```
 
-The test suite is organised as five files: `validation.test.js` (request shape, request
+The test suite is organised as six files: `validation.test.js` (request shape, request
 policy, the lock, tickets), `manager.test.js` (the pipeline, checkpoint gate, duplicate
 suppression, cooldowns, the system gate, cancellation, reconciliation, breaker
 integration, supervisor presence, status, the audit log), `supervisor.test.js` (liveness
 probes, breaker, launch derivation, the state machine, the run loop), `plugin.test.js`
 (plugin exports, `applyRestart`, the model-facing tools, protocol conformance, and the
-plugin/supervisor agreement on tickets) and `integration.test.js` (the supervisor's own
+plugin/supervisor agreement on tickets), `integration.test.js` (the supervisor's own
 command line and exit codes, the four PowerShell scripts parsed and inspected for
-forbidden operations, and repository hygiene). `tests/helpers/rig.js` and
-`tests/helpers/checkpoints.js` provide the injected seams every test drives the real
-classes through — the unit suites reboot nothing, kill nothing and shell out to nothing;
-`integration.test.js` is the one file that starts a process, and the process it starts is
-the supervisor with `--max-ticks 1`.
+forbidden operations, and repository hygiene) and `cross-plugin.test.js` (the documented
+bridge to `dsh-health-scheduler`, driven end to end through **both** real plugins —
+it imports the sibling checkout, so it skips when that checkout is absent).
+`tests/helpers/rig.js` and `tests/helpers/checkpoints.js` provide the injected seams
+every test drives the real classes through — the unit suites reboot nothing, kill
+nothing and shell out to nothing; `integration.test.js` is the one file that starts a
+process, and the process it starts is the supervisor with `--max-ticks 1`.
+
+`cross-plugin.test.js` is the only file that reaches outside this repository, and it does
+so deliberately: the seam between the two plugins is prose in a README, and prose that
+nothing executes is prose that rots. It builds the four-line `RestartAdapter` the health
+scheduler documents on top of this plugin's real `RestartManager`, then drives a real
+`HealthScheduler` decision through it and asserts on the ticket that came out the other
+side. It found one calibration fact worth recording: because a single measured dimension
+renormalizes to `effectiveWeight: 1.0`, a saturated lone metric reads `restart_pressure:
+100`, so the test pins a sub-saturating value and a matching ladder rather than letting
+the top rung fire.
 
 ## Design section 15: the fifteen acceptance criteria
 

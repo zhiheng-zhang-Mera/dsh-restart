@@ -1,4 +1,7 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
+# Deliberately 5.1, not 7.0: nothing in these scripts uses a 7-only feature, and
+# Windows PowerShell 5.1 ships with every supported Windows version, so this is the
+# widest requirement that is still truthful. Verified under both 5.1 and 7.
 <#
 .SYNOPSIS
     Disables dsh-restart: sets the plugin's `enabled: false` in the profile's
@@ -85,12 +88,26 @@ param(
     [Parameter()][string] $Profile = 'web',
     [Parameter()][string] $ProfileDirectory,
     [Parameter()][string] $StateDirectory,
-    [Parameter()][string] $RepoPath = (Split-Path -Parent $PSScriptRoot),
+    [Parameter()][string] $RepoPath,
     [Parameter()][string] $Reason = 'manual_disable_by_operator',
     [Parameter()][switch] $AllowCreate
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Resolve defaults that depend on automatic variables.
+#
+# `$PSScriptRoot` is not populated yet when a `param()` default is evaluated under
+# `powershell.exe -File`, so the repository root is derived here instead. The scripts
+# live in `<repo>/scripts`, which makes the repository root their parent directory.
+if ([string]::IsNullOrWhiteSpace($RepoPath)) {
+    $scriptDirectory = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        $PSScriptRoot
+    }
+    $RepoPath = (Resolve-Path (Join-Path $scriptDirectory '..')).Path
+}
 
 # ---------------------------------------------------------------------------- state
 

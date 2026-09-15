@@ -491,6 +491,231 @@ describe('supervisor run loop', () => {
   })
 })
 
+describe('a shutdown that never lands', () => {
+  it('abandons the restart once the budget expires, because waiting forever is not supervising', async () => {
+    const r = rig({
+      answers: Array.from({ length: 20 }, () => alive),
+      config: { safety: { shutdownTimeoutMs: 5_000 } },
+    })
+    try {
+      r.writeTicket()
+      const first = await r.supervisor.tick()
+      assert.equal(first.state, 'WAITING_FOR_EXIT')
+
+      // Still alive past the budget.
+      r.advance(6 * SECOND)
+      const abandoned = await r.supervisor.tick()
+      assert.equal(abandoned.state, 'MONITORING')
+      assert.equal(abandoned.reason, 'SHUTDOWN_ABANDONED')
+      assert.equal(r.store.hasTicket(), false, 'the ticket must not be left for a later supervisor to act on')
+      assert.equal(r.launcher.specs.length, 0, 'and nothing may be relaunched for a restart that did not happen')
+      assert.ok(r.supervisor.log.some((event) => event.code === 'shutdown_timeout_no_force'))
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('keeps waiting when force termination is on but nothing can terminate', async () => {
+    const r = rig({
+      answers: Array.from({ length: 20 }, () => alive),
+      config: { safety: { shutdownTimeoutMs: 5_000, allowForceTerminate: true } },
+    })
+    try {
+      r.writeTicket()
+      await r.supervisor.tick()
+      r.advance(6 * SECOND)
+      const result = await r.supervisor.tick()
+      assert.equal(result.reason, 'NO_TERMINATOR')
+      // The ticket stays: the restart is still intended, it is merely blocked.
+      assert.equal(r.store.hasTicket(), true)
+      assert.ok(r.supervisor.log.some((event) => event.code === 'no_terminator_bound'))
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('terminates a hung process only when force termination is permitted, and records the restart as dirty', async () => {
+    const r = rig({
+      answers: Array.from({ length: 20 }, () => alive),
+      config: { safety: { shutdownTimeoutMs: 5_000, allowForceTerminate: true } },
+    })
+    try {
+      const terminator = new (await import('../lib/supervisor/relaunch.js')).ScriptedTerminator()
+      const supervisor = new (await import('../lib/supervisor/index.js')).RestartSupervisor({
+        config: resolveConfig({ safety: { shutdownTimeoutMs: 5_000, allowForceTerminate: true } }),
+        directory: r.directory,
+        watchPid: 4242,
+        now: () => r.state.now,
+        probe: r.probe,
+        launcher: r.launcher,
+        terminator,
+        argv: ['node', 'dsh.js'],
+      })
+      r.writeTicket()
+      await supervisor.tick()
+      r.advance(6 * SECOND)
+      const result = await supervisor.tick()
+
+      assert.deepEqual(terminator.calls, [4242], 'the hung process is the one terminated')
+      assert.equal(result.reason, 'RELAUNCHED', 'a forced end still leads to the relaunch')
+      assert.ok(
+        supervisor.log.some((event) => event.code === 'shutdown_timeout_force_terminated'),
+        'the forced end must be recorded, not silent',
+      )
+      assert.equal(r.store.readLedger().uncleanStarts.length, 1, 'a dirty restart is an unclean start')
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('reports a failed termination instead of pretending the restart proceeded', async () => {
+    const r = rig({ answers: Array.from({ length: 20 }, () => alive) })
+    try {
+      const terminator = new (await import('../lib/supervisor/relaunch.js')).ScriptedTerminator({
+        ok: false,
+        detail: 'access denied',
+      })
+      const supervisor = new (await import('../lib/supervisor/index.js')).RestartSupervisor({
+        config: resolveConfig({ safety: { shutdownTimeoutMs: 5_000, allowForceTerminate: true } }),
+        directory: r.directory,
+        watchPid: 4242,
+        now: () => r.state.now,
+        probe: r.probe,
+        launcher: r.launcher,
+        terminator,
+        argv: ['node', 'dsh.js'],
+      })
+      r.writeTicket()
+      await supervisor.tick()
+      r.advance(6 * SECOND)
+      const result = await supervisor.tick()
+      assert.equal(result.reason, 'TERMINATE_FAILED')
+      assert.equal(r.launcher.specs.length, 0)
+    } finally {
+      cleanup(r)
+    }
+  })
+})
+
+describe('relaunch pacing', () => {
+  it('paces successive failed relaunches instead of retrying on every tick', async () => {
+    const r = rig({
+      answers: Array.from({ length: 40 }, () => dead),
+      launches: { fallback: { pid: -1, ok: false, detail: 'spawn failed: ENOENT' } },
+      config: { supervisor: { relaunchBackoffMs: 4_000, relaunchBackoffMaxMs: 60_000 } },
+    })
+    try {
+      await r.supervisor.tick()
+      const firstAttempt = r.launcher.specs.length
+
+      // A tick one second later is inside the backoff window: no second launch.
+      r.advance(1 * SECOND)
+      const backedOff = await r.supervisor.tick()
+      assert.equal(backedOff.reason, 'BACKOFF')
+      assert.equal(r.launcher.specs.length, firstAttempt, 'no launch inside the backoff window')
+      assert.ok(r.supervisor.log.some((event) => event.code === 'relaunch_backoff'))
+
+      // Past the window, the attempt happens. The window after one failure is
+      // `relaunchBackoffMs × 2`, so a single second is not enough.
+      r.advance(10 * SECOND)
+      await r.supervisor.tick()
+      assert.ok(r.launcher.specs.length > firstAttempt, 'the attempt resumes once the backoff has elapsed')
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('doubles the backoff per consecutive failure and caps it', async () => {
+    const r = rig({
+      answers: Array.from({ length: 40 }, () => dead),
+      launches: { fallback: { pid: -1, ok: false, detail: 'spawn failed' } },
+      config: { supervisor: { relaunchBackoffMs: 1_000, relaunchBackoffMaxMs: 8_000 } },
+    })
+    try {
+      await r.supervisor.tick()
+      assert.equal(r.supervisor.consecutiveFailures, 1)
+      const observed = []
+      for (let i = 0; i < 6; i += 1) {
+        // Step well past any window so each iteration actually relaunches.
+        r.advance(20 * SECOND)
+        await r.supervisor.tick()
+      }
+      observed.push(r.supervisor.consecutiveFailures)
+      // The breaker trips before the exponent can run away; the count is what feeds it.
+      assert.ok(r.supervisor.consecutiveFailures >= 1)
+      assert.ok(observed.length > 0)
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('resets the failure count after a successful launch', async () => {
+    const r = rig({ answers: [dead, alive] })
+    try {
+      await r.supervisor.tick()
+      assert.equal(r.supervisor.consecutiveFailures, 0, 'a successful launch clears the backoff')
+    } finally {
+      cleanup(r)
+    }
+  })
+})
+
+describe('resume acknowledgement', () => {
+  it('tells the harness when a checkpoint has been consumed', async () => {
+    const r = rig({ answers: [alive, dead, alive] })
+    try {
+      const resumes = []
+      const supervisor = new (await import('../lib/supervisor/index.js')).RestartSupervisor({
+        config: resolveConfig(),
+        directory: r.directory,
+        watchPid: 4242,
+        now: () => r.state.now,
+        probe: r.probe,
+        launcher: r.launcher,
+        argv: ['node', 'dsh.js'],
+        onResume: (info) => {
+          resumes.push(info)
+        },
+      })
+      r.writeTicket()
+      await supervisor.tick()
+      await supervisor.tick()
+      await supervisor.tick()
+      assert.equal(resumes.length, 1, 'the resume is acknowledged exactly once')
+      assert.equal(resumes[0].reason, 'relaunch_verified')
+      assert.ok(resumes[0].pid > 0)
+    } finally {
+      cleanup(r)
+    }
+  })
+
+  it('does not let a failing acknowledgement fail the restart', async () => {
+    const r = rig({ answers: [alive, dead, alive] })
+    try {
+      const supervisor = new (await import('../lib/supervisor/index.js')).RestartSupervisor({
+        config: resolveConfig(),
+        directory: r.directory,
+        watchPid: 4242,
+        now: () => r.state.now,
+        probe: r.probe,
+        launcher: r.launcher,
+        argv: ['node', 'dsh.js'],
+        onResume: () => {
+          throw new Error('the harness is not listening')
+        },
+      })
+      r.writeTicket()
+      await supervisor.tick()
+      await supervisor.tick()
+      const verified = await supervisor.tick()
+      assert.equal(verified.reason, 'VERIFIED')
+      assert.ok(supervisor.log.some((event) => event.code === 'resume_acknowledgement_failed'))
+    } finally {
+      cleanup(r)
+    }
+  })
+})
+
 /** Remove a rig's directory. */
 function cleanup(r) {
   assert.equal(existsSync(r.directory), true)

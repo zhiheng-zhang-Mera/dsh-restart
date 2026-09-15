@@ -64,6 +64,17 @@ export interface SupervisorConfig {
   readonly ticketTtlMs: number
   /** Run the supervisor detached from the plugin process. */
   readonly detach: boolean
+  /**
+   * Minimum milliseconds between two relaunch attempts.
+   *
+   * A relaunch that fails is retried with an exponential delay up to
+   * {@link SupervisorConfig.relaunchBackoffMaxMs}, because a launch that fails once
+   * usually fails again immediately — and a supervisor that retries in a tight loop
+   * is indistinguishable from a fork bomb.
+   */
+  readonly relaunchBackoffMs: number
+  /** Ceiling of the relaunch backoff. */
+  readonly relaunchBackoffMaxMs: number
 }
 
 /** Where durable state lives. */

@@ -319,6 +319,89 @@ describe('system restart gate', () => {
     }
   })
 
+  it('performs a real reboot through the system-shutdown port', async () => {
+    const requests = []
+    const rig = new RestartRig({
+      config: { allowSystemReboot: true, systemRestart: { enabled: true } },
+      systemShutdown: {
+        id: 'scripted-system',
+        requestSystemRestart(reason, delaySeconds) {
+          requests.push({ reason, delaySeconds })
+          return true
+        },
+      },
+    })
+    try {
+      const response = await rig.requestSystem()
+      assert.equal(response.accepted, true)
+      assert.equal(requests.length, 1, 'the machine restart port must actually be called')
+      assert.match(requests[0].reason, /^system-/, 'the ticket id is the reason, so the event log is traceable')
+      assert.ok(requests[0].delaySeconds > 0, 'a non-zero delay lets the audit record land first')
+      assert.match(response.detail, /the machine will reboot/)
+      // A system restart must not also ask the host to exit: the host exiting is not a
+      // reboot, and conflating the two is how a reboot silently becomes a shutdown.
+      assert.deepEqual(rig.lifecycle.requests, [], 'no application shutdown request for a system restart')
+    } finally {
+      rig.dispose()
+    }
+  })
+
+  it('refuses a system restart when the machine has no reboot port, rather than downgrading it', async () => {
+    const rig = new RestartRig({
+      config: { allowSystemReboot: true, systemRestart: { enabled: true } },
+      systemShutdown: null,
+    })
+    try {
+      const response = await rig.requestSystem()
+      assert.equal(response.accepted, false)
+      assert.equal(response.reason, 'SYSTEM_REBOOT_FAILED')
+      assert.match(response.detail, /no system-shutdown port is bound/)
+      assert.equal(rig.store.hasTicket(), false, 'a refused reboot leaves no ticket')
+      assert.equal(rig.manager.lockState, 'IDLE')
+      assert.deepEqual(rig.lifecycle.requests, [], 'and does not silently become an application restart')
+    } finally {
+      rig.dispose()
+    }
+  })
+
+  it('refuses when the reboot port itself refuses', async () => {
+    const rig = new RestartRig({
+      config: { allowSystemReboot: true, systemRestart: { enabled: true } },
+      systemShutdown: { id: 'scripted-system', requestSystemRestart: () => false },
+    })
+    try {
+      const response = await rig.requestSystem()
+      assert.equal(response.accepted, false)
+      assert.equal(response.reason, 'SYSTEM_REBOOT_FAILED')
+      assert.match(response.detail, /refused the reboot/)
+      assert.equal(rig.store.hasTicket(), false)
+    } finally {
+      rig.dispose()
+    }
+  })
+
+  it('refuses when the reboot port throws', async () => {
+    const rig = new RestartRig({
+      config: { allowSystemReboot: true, systemRestart: { enabled: true } },
+      systemShutdown: {
+        id: 'scripted-system',
+        requestSystemRestart: () => {
+          throw new Error('shutdown.exe is missing')
+        },
+      },
+    })
+    try {
+      const response = await rig.requestSystem()
+      assert.equal(response.accepted, false)
+      assert.equal(response.reason, 'SYSTEM_REBOOT_FAILED')
+      assert.match(response.detail, /shutdown.exe is missing/)
+      assert.equal(rig.store.hasTicket(), false)
+      assert.equal(rig.manager.lockState, 'IDLE')
+    } finally {
+      rig.dispose()
+    }
+  })
+
   it('reports the system capability when a port and the permissions are both present', async () => {
     const rig = new RestartRig({
       config: { allowSystemReboot: true, systemRestart: { enabled: true } },
@@ -583,6 +666,110 @@ describe('audit log', () => {
       assert.equal(rig.audit.size, 2, 'the in-memory ring is bounded')
       assert.equal(rig.manager.getRestartStatus().recent.length, 2)
       assert.equal(rig.audit.readPersisted().length, 4, 'the file keeps the full history')
+    } finally {
+      rig.dispose()
+    }
+  })
+})
+
+describe('accepting a restart is recorded before the process disappears', () => {
+  it('writes the audit record before returning the response', async () => {
+    const rig = new RestartRig()
+    try {
+      const response = await rig.request({ requestId: 'req-audit' })
+      assert.equal(response.accepted, true)
+      const latest = rig.audit.recent(1)[0]
+      assert.equal(latest.requestId, 'req-audit')
+      assert.equal(latest.state, 'shutting_down')
+      assert.equal(latest.outcomeCode, 'ACCEPTED')
+      assert.match(latest.detail, /checkpoint ck-1/)
+      // The file is written too, not just the ring: the process may vanish next.
+      const persisted = rig.audit.readPersisted()
+      assert.ok(persisted.some((record) => record.requestId === 'req-audit'))
+    } finally {
+      rig.dispose()
+    }
+  })
+})
+
+describe('supervisor safe mode is bridged into the plugin', () => {
+  it('refuses restarts while the supervisor ledger reports safe mode', async () => {
+    const rig = new RestartRig()
+    try {
+      assert.equal(rig.manager.supervisorSafeMode, false)
+      assert.equal(rig.manager.getRestartStatus().crashLoop.tripped, false)
+
+      // The supervisor is a different process and it outlives a restart, so its
+      // durable ledger is the only way a crash loop reaches this plugin.
+      rig.store.writeLedger({
+        schemaVersion: 1,
+        uncleanStarts: [],
+        safeMode: true,
+        safeModeReason: 'crash_loop',
+        safeModeAt: new Date(rig.now).toISOString(),
+        relaunches: 3,
+      })
+
+      assert.equal(rig.manager.supervisorSafeMode, true)
+      const status = rig.manager.getRestartStatus()
+      assert.equal(status.crashLoop.tripped, true)
+      assert.match(status.crashLoop.reason, /supervisor: crash_loop/)
+      assert.equal(status.canRestart.allowed, false)
+      assert.equal(status.canRestart.reason, RefusalCodes.CRASH_LOOP)
+
+      const response = await rig.request({ requestId: 'req-while-safe-mode' })
+      assert.equal(response.accepted, false)
+      assert.equal(response.reason, RefusalCodes.CRASH_LOOP)
+
+      // Clearing the ledger restores automation.
+      rig.store.writeLedger({
+        schemaVersion: 1,
+        uncleanStarts: [],
+        safeMode: false,
+        safeModeReason: null,
+        safeModeAt: null,
+        relaunches: 3,
+      })
+      const after = await rig.request({ requestId: 'req-after-safe-mode' })
+      assert.equal(after.accepted, true)
+    } finally {
+      rig.dispose()
+    }
+  })
+})
+
+describe('resume acknowledgement', () => {
+  it('forwards the token to the checkpoint port and reports the answer', async () => {
+    const tokens = []
+    const rig = new RestartRig({
+      checkpoint: {
+        id: 'spy',
+        prepareForRestart: () => ({
+          safe: true,
+          reason: 'idle',
+          checkpointId: 'ck-1',
+          resumeToken: 'rs-1',
+          completed: true,
+          detail: 'ok',
+        }),
+        acknowledgeResume(resumeToken) {
+          tokens.push(resumeToken)
+          return true
+        },
+      },
+    })
+    try {
+      assert.equal(await rig.manager.acknowledgeResume('rs-1'), true)
+      assert.deepEqual(tokens, ['rs-1'])
+    } finally {
+      rig.dispose()
+    }
+  })
+
+  it('reports failure instead of throwing when the port is unbound', async () => {
+    const rig = new RestartRig({ checkpoint: new UnboundCheckpointPort() })
+    try {
+      assert.equal(await rig.manager.acknowledgeResume(null), false)
     } finally {
       rig.dispose()
     }

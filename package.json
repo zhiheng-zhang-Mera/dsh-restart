@@ -56,7 +56,8 @@
     "test:only": "node --test tests/*.test.js",
     "supervisor": "node bin/supervisor.mjs",
     "verify:artifacts": "node scripts/verify-artifacts.mjs",
-    "verify:patch": "node scripts/verify-patch.mjs"
+    "verify:patch": "node scripts/verify-patch.mjs",
+    "verify": "npm run typecheck && npm run verify:artifacts && npm run verify:patch"
   },
   "dependencies": {},
   "peerDependencies": {

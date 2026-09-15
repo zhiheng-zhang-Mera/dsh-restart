@@ -8,7 +8,7 @@
  * @module dsh-restart/supervisor/relaunch
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import type { SupervisorConfig } from '../shared/types.js'
 
 /** A launch specification. */
@@ -34,6 +34,84 @@ export interface LaunchResult {
 export interface ProcessLauncher {
   /** Start one process. */
   launch(spec: LaunchSpec): Promise<LaunchResult>
+}
+
+/**
+ * What the supervisor uses to end a process that ignored its graceful shutdown.
+ *
+ * Deliberately separate from {@link ProcessLauncher}, and deliberately optional: the
+ * default supervisor cannot terminate anything, so "the shutdown hung" produces an
+ * abandoned restart rather than a kill. A deployment that wants the stronger
+ * behaviour has to inject this and turn on `safety.allowForceTerminate`.
+ */
+export interface ProcessTerminator {
+  /** End the process. */
+  terminate(pid: number): Promise<{ readonly ok: boolean; readonly detail: string }>
+}
+
+/** Terminates processes with `taskkill` on Windows and `SIGKILL` elsewhere. */
+export class SystemProcessTerminator implements ProcessTerminator {
+  private readonly platform: NodeJS.Platform
+  private readonly runner: (file: string, args: readonly string[]) => Promise<{ readonly code: number; readonly stderr: string }>
+
+  constructor(options: {
+    readonly platform?: NodeJS.Platform
+    readonly runner?: (file: string, args: readonly string[]) => Promise<{ readonly code: number; readonly stderr: string }>
+  } = {}) {
+    this.platform = options.platform ?? process.platform
+    this.runner = options.runner ?? runTerminate
+  }
+
+  async terminate(pid: number): Promise<{ readonly ok: boolean; readonly detail: string }> {
+    if (this.platform === 'win32') {
+      // `/T` also ends the process's children, which is what a launcher tree needs.
+      const result = await this.runner('taskkill.exe', ['/PID', String(pid), '/T', '/F'])
+      return result.code === 0
+        ? { ok: true, detail: `taskkill terminated pid ${pid} and its children` }
+        : { ok: false, detail: `taskkill exited with ${result.code}: ${result.stderr}` }
+    }
+    try {
+      process.kill(pid, 'SIGKILL')
+      return { ok: true, detail: `SIGKILL sent to pid ${pid}` }
+    } catch (error) {
+      return { ok: false, detail: `SIGKILL failed: ${(error as Error).message}` }
+    }
+  }
+}
+
+/** A terminator a test drives. */
+export class ScriptedTerminator implements ProcessTerminator {
+  /** Every pid passed to {@link terminate}, in order. */
+  readonly calls: number[] = []
+  private readonly result: { readonly ok: boolean; readonly detail: string }
+
+  constructor(result: { readonly ok: boolean; readonly detail: string } = { ok: true, detail: 'scripted termination' }) {
+    this.result = result
+  }
+
+  terminate(pid: number): Promise<{ readonly ok: boolean; readonly detail: string }> {
+    this.calls.push(pid)
+    return Promise.resolve(this.result)
+  }
+}
+
+/** Run `taskkill` without a shell. */
+function runTerminate(
+  file: string,
+  args: readonly string[],
+): Promise<{ readonly code: number; readonly stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(file, [...args], { windowsHide: true, timeout: 30_000, maxBuffer: 256 * 1024 }, (error, _stdout, stderr) => {
+      if (error === null) {
+        resolve({ code: 0, stderr: String(stderr ?? '') })
+        return
+      }
+      const code = typeof (error as unknown as { code?: number }).code === 'number'
+        ? ((error as unknown as { code: number }).code as number)
+        : 1
+      resolve({ code, stderr: `${error.message}\n${String(stderr ?? '')}`.trim() })
+    })
+  })
 }
 
 /**

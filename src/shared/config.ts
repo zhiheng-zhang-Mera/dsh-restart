@@ -69,6 +69,8 @@ export const DEFAULT_CONFIG: RestartConfig = Object.freeze({
     pollIntervalMs: 1 * SECOND,
     ticketTtlMs: 10 * MINUTE,
     detach: true,
+    relaunchBackoffMs: 2 * SECOND,
+    relaunchBackoffMaxMs: 60 * SECOND,
   }),
 
   storage: Object.freeze({
@@ -205,12 +207,20 @@ export function resolveConfig(overrides: RestartConfigOverrides = {}): RestartCo
     pollIntervalMs: requirePositive('supervisor.pollIntervalMs', merged.supervisor.pollIntervalMs),
     ticketTtlMs: requirePositive('supervisor.ticketTtlMs', merged.supervisor.ticketTtlMs),
     detach: requireBoolean('supervisor.detach', merged.supervisor.detach),
+    relaunchBackoffMs: requireNonNegative('supervisor.relaunchBackoffMs', merged.supervisor.relaunchBackoffMs),
+    relaunchBackoffMaxMs: requirePositive('supervisor.relaunchBackoffMaxMs', merged.supervisor.relaunchBackoffMaxMs),
   }
 
   if (supervisor.heartbeatTimeoutMs <= supervisor.heartbeatIntervalMs) {
     throw new ConfigError(
       'supervisor.heartbeatTimeoutMs',
       `must exceed supervisor.heartbeatIntervalMs (${supervisor.heartbeatIntervalMs}), received ${supervisor.heartbeatTimeoutMs}`,
+    )
+  }
+  if (supervisor.relaunchBackoffMaxMs < supervisor.relaunchBackoffMs) {
+    throw new ConfigError(
+      'supervisor.relaunchBackoffMaxMs',
+      `must be at least supervisor.relaunchBackoffMs (${supervisor.relaunchBackoffMs}), received ${supervisor.relaunchBackoffMaxMs}`,
     )
   }
   if (supervisor.relaunchTimeoutMs < supervisor.heartbeatIntervalMs) {

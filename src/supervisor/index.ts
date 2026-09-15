@@ -26,6 +26,7 @@ import {
   deriveLaunchSpec,
   type LaunchSpec,
   type ProcessLauncher,
+  type ProcessTerminator,
 } from './relaunch.js'
 
 /** One line in the supervisor's own log. */
@@ -56,6 +57,18 @@ export interface RestartSupervisorOptions {
   readonly probe?: LivenessProbe
   /** Injectable process launcher. */
   readonly launcher?: ProcessLauncher
+  /**
+   * Terminates a process that ignored its graceful shutdown.
+   *
+   * Only consulted when `safety.allowForceTerminate` is on, and `null` by default:
+   * a supervisor that can kill on its own is a supervisor that can kill by mistake.
+   */
+  readonly terminator?: ProcessTerminator | null
+  /**
+   * Called once a relaunch has been observed alive, so the harness can acknowledge
+   * that a checkpoint was consumed. Failures are contained.
+   */
+  readonly onResume?: (info: { readonly pid: number; readonly reason: string }) => void | Promise<void>
   /** `argv` used when `supervisor.launchCommand` is unset. Defaults to this process's argv. */
   readonly argv?: readonly string[]
   /** Working directory used when `supervisor.launchCwd` is unset. Defaults to `process.cwd()`. */
@@ -84,6 +97,10 @@ export class RestartSupervisor {
   private readonly argv: readonly string[]
   private readonly cwd: string
   private readonly terminateAfterVerify: boolean
+  private readonly terminator: ProcessTerminator | null
+  private readonly onResume: ((info: { readonly pid: number; readonly reason: string }) => void | Promise<void>) | null
+  private lastRelaunchAt: number | null = null
+  private consecutiveRelaunchFailures = 0
 
   private watchedPid: number
   private state: SupervisorState = 'MONITORING'
@@ -103,7 +120,10 @@ export class RestartSupervisor {
     this.argv = options.argv ?? process.argv.slice(1)
     this.cwd = options.cwd ?? process.cwd()
     this.terminateAfterVerify = options.terminateAfterVerify === true
+    this.terminator = options.terminator ?? null
+    this.onResume = options.onResume ?? null
     this.watchedPid = options.watchPid ?? process.ppid
+    this.stateSinceMs = this.now()
     this.breaker = new CrashLoopBreaker({ config: this.config.safety, ledger: this.store.readLedger() })
     this.heartbeat = new HeartbeatWriter({
       store: this.store,
@@ -187,16 +207,34 @@ export class RestartSupervisor {
         return this.result('WAITING_FOR_EXIT', 'PROBE_FAILED')
       }
       if (alive) {
+        // The host was asked to exit and has not. That is not a reason to wait
+        // forever: a shutdown that never lands is exactly the failure mode the
+        // design's case 4 describes, and the answer is a bounded wait followed by a
+        // recorded decision rather than an indefinite one.
+        const waited = nowMs - this.stateSinceMs
+        if (waited >= this.config.safety.shutdownTimeoutMs) {
+          return this.onShutdownTimeout(ticket, waited)
+        }
         return this.result('WAITING_FOR_EXIT', 'WAITING')
       }
       this.store.clearTicket()
-      return this.relaunch(alive === false ? 'expected_exit_observed' : 'unknown')
+      return this.relaunch('expected_exit_observed')
     }
 
     if (this.state === 'WAITING_FOR_HEARTBEAT') {
       if (alive === true) {
         this.verified = true
         this.setState('VERIFIED', 'relaunch_verified', { pid: this.watchedPid })
+        // The harness asked to be told when a checkpoint is consumed. Telling it is
+        // the last step of the restart, and a failure here must not be mistaken for
+        // a failure of the restart itself.
+        if (this.onResume !== null) {
+          try {
+            await this.onResume({ pid: this.watchedPid, reason: 'relaunch_verified' })
+          } catch (error) {
+            this.emit('VERIFIED', 'resume_acknowledgement_failed', (error as Error).message)
+          }
+        }
         this.setState('MONITORING', 'monitoring_resumed', { pid: this.watchedPid })
         return this.result('MONITORING', 'VERIFIED')
       }
@@ -293,7 +331,90 @@ export class RestartSupervisor {
     })
   }
 
+  /**
+   * Decide what to do when the host ignored its own graceful shutdown.
+   *
+   * Three outcomes, in order of preference:
+   *
+   * 1. `allowForceTerminate` is on and a terminator is bound: terminate, record the
+   *    restart as dirty, and relaunch.
+   * 2. `allowForceTerminate` is on but nothing can terminate: say so and keep waiting,
+   *    because a supervisor has no business inventing a kill.
+   * 3. The default: abandon the restart, clear the ticket, and report it. The
+   *    process keeps running with its ticket gone, which is the safe reading —
+   *    "the restart did not happen" rather than "something was killed to make it
+   *    happen".
+   */
+  private async onShutdownTimeout(ticket: RestartTicket | null, waitedMs: number): Promise<SupervisorRunResult> {
+    const ticketId = ticket?.requestId ?? 'unknown'
+    if (!this.config.safety.allowForceTerminate) {
+      this.store.clearTicket()
+      this.recordUnclean('shutdown_timeout_no_force', {
+        ticketId,
+        waitedMs,
+        forceTerminate: false,
+      })
+      this.setState('MONITORING', 'shutdown_abandoned', { ticketId, waitedMs })
+      return this.result('MONITORING', 'SHUTDOWN_ABANDONED')
+    }
+
+    if (this.terminator === null) {
+      this.emit('WAITING_FOR_EXIT', 'no_terminator_bound', 'allowForceTerminate is on but no terminator is bound', {
+        ticketId,
+        waitedMs,
+      })
+      return this.result('WAITING_FOR_EXIT', 'NO_TERMINATOR')
+    }
+
+    const terminated = await this.terminator.terminate(this.watchedPid)
+    this.store.clearTicket()
+    this.recordUnclean('shutdown_timeout_force_terminated', {
+      ticketId,
+      waitedMs,
+      forceTerminate: true,
+      terminated: terminated.ok,
+      detail: terminated.detail,
+    })
+    if (!terminated.ok) {
+      return this.result('WAITING_FOR_EXIT', 'TERMINATE_FAILED')
+    }
+    // The exit path is now the ordinary one, but the restart is recorded as dirty
+    // because a process that had to be killed did not reach a safe point.
+    return this.relaunch('dirty_restart_after_force_terminate')
+  }
+
+  /**
+   * Record an unclean start and feed the outcome to the breaker.
+   *
+   * @returns the verdict for the next relaunch.
+   */
+  private recordUnclean(
+    reason: string,
+    detail: Readonly<Record<string, unknown>>,
+  ): ReturnType<CrashLoopBreaker['recordUncleanStart']> {
+    const verdict = this.breaker.recordUncleanStart(reason, this.now())
+    this.persistLedger()
+    this.emit(this.state, reason, reason, { ...detail, failuresInWindow: verdict.failuresInWindow })
+    return verdict
+  }
+
   private async relaunch(reason: string): Promise<SupervisorRunResult> {
+    // Pace successive attempts. A relaunch that fails once usually fails again
+    // immediately, and a supervisor that retries on every poll tick is
+    // indistinguishable from a fork bomb.
+    if (this.lastRelaunchAt !== null) {
+      const since = this.now() - this.lastRelaunchAt
+      const backoff = this.relaunchBackoffMs()
+      if (since < backoff) {
+        this.emit('RELAUNCHING', 'relaunch_backoff', 'waiting before the next relaunch attempt', {
+          sinceMs: since,
+          backoffMs: backoff,
+          consecutiveFailures: this.consecutiveRelaunchFailures,
+        })
+        return this.result('RELAUNCHING', 'BACKOFF')
+      }
+    }
+
     this.setState('RELAUNCHING', 'relaunching', { reason })
 
     const verdict = this.breaker.verdict(this.now())
@@ -316,10 +437,13 @@ export class RestartSupervisor {
     this.lastLaunch = spec
 
     const launched = await this.launcher.launch(spec)
+    this.lastRelaunchAt = this.now()
     if (!launched.ok || launched.pid <= 0) {
+      this.consecutiveRelaunchFailures += 1
       const unclean = this.breaker.recordUncleanStart('relaunch_failed', this.now())
       this.emit('RELAUNCHING', 'relaunch_failed', launched.detail, {
         failuresInWindow: unclean.failuresInWindow,
+        consecutiveFailures: this.consecutiveRelaunchFailures,
       })
       this.persistLedger()
       if (!unclean.allowed) {
@@ -331,6 +455,7 @@ export class RestartSupervisor {
     }
 
     this.relaunches += 1
+    this.consecutiveRelaunchFailures = 0
     this.watchedPid = launched.pid
     this.heartbeat.watch(launched.pid)
     this.persistLedger()
@@ -352,24 +477,31 @@ export class RestartSupervisor {
   }
 
   private setState(state: SupervisorState, code: string, detail: Readonly<Record<string, unknown>>): void {
+    // Entering the state you are already in is not a transition, and must not reset
+    // the deadline that state is waiting on — otherwise a wait that should expire
+    // gets a fresh budget on every poll and never does.
+    if (state === this.state) {
+      this.heartbeat.setState(state)
+      return
+    }
     this.state = state
     this.stateSinceMs = this.now()
     this.heartbeat.setState(state)
     this.emit(state, code, code, detail)
   }
 
-  private stateSinceMsValue = 0
-
-  private get stateSince(): number {
-    return this.stateSinceMsValue
-  }
-
-  private set stateSinceMs(value: number) {
-    this.stateSinceMsValue = value
-  }
+  /**
+   * When the current state was entered.
+   *
+   * Seeded in the constructor with the clock rather than left at zero: a supervisor
+   * built with an injectable clock that starts at a fixed epoch would otherwise
+   * measure its very first wait from that epoch, and every deadline would look long
+   * expired before the first tick.
+   */
+  private stateSinceMs = 0
 
   private stateEnteredAtMs(): number {
-    return this.stateSince
+    return this.stateSinceMs
   }
 
 
@@ -407,6 +539,20 @@ export class RestartSupervisor {
   /** The pending ticket, or `null`. */
   pendingTicket(): RestartTicket | null {
     return this.store.readTicket(this.now()).ticket
+  }
+
+  /** Current relaunch backoff, doubling per consecutive failure up to the ceiling. */
+  private relaunchBackoffMs(): number {
+    const base = this.config.supervisor.relaunchBackoffMs
+    if (base <= 0) return 0
+    // Capped at six doublings so the exponent cannot run away on a long incident.
+    const steps = Math.min(this.consecutiveRelaunchFailures, 6)
+    return Math.min(base * 2 ** steps, this.config.supervisor.relaunchBackoffMaxMs)
+  }
+
+  /** Consecutive failed relaunch attempts, reset by a successful launch. */
+  get consecutiveFailures(): number {
+    return this.consecutiveRelaunchFailures
   }
 }
 

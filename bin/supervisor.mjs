@@ -22,6 +22,7 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { RestartSupervisor } from '../lib/supervisor/index.js'
+import { SystemProcessTerminator } from '../lib/supervisor/relaunch.js'
 import { resolveConfig } from '../lib/shared/config.js'
 
 /** Parse the supervisor's own flags. Unknown flags are an error, not a guess. */
@@ -95,10 +96,12 @@ async function main() {
     return 0
   }
 
+  // `--` with nothing after it means "no explicit command", not "an empty command":
+  // treat it exactly like omitting the separator, so the supervisor falls back to
+  // relaunching the command that started it.
+  const explicitLaunch = options.launch !== null && options.launch.length > 0 ? options.launch : null
   const config = resolveConfig(
-    options.launch === null
-      ? {}
-      : { supervisor: { launchCommand: options.launch, detach: false } },
+    explicitLaunch === null ? {} : { supervisor: { launchCommand: explicitLaunch, detach: false } },
   )
 
   const stateDirectory =
@@ -130,6 +133,10 @@ async function main() {
     directory: stateDirectory,
     ...(options.watchPid === null || !Number.isFinite(options.watchPid) ? {} : { watchPid: options.watchPid }),
     terminateAfterVerify: options.terminateAfterVerify,
+    // Bound only when the configuration permits it, so the shipped supervisor cannot
+    // end a process at all: a hung shutdown becomes an abandoned restart unless an
+    // operator has explicitly asked for the stronger behaviour.
+    terminator: config.safety.allowForceTerminate ? new SystemProcessTerminator() : null,
     onEvent: emit,
   })
 
@@ -154,7 +161,10 @@ async function main() {
   // This entry point therefore holds the loop open itself, and releases it as soon as
   // the run reaches a terminal state. The library keeps its unref'd timers, so an
   // embedder that calls `run()` is still never held open against its will.
-  const keepAlive = setInterval(() => {}, 2_147_483_647)
+  // The interval must stay inside the 32-bit millisecond range: 2 ** 31 - 1 wraps
+  // to 1 ms and turns this into a busy loop. An hour is far longer than the gap
+  // between two polls, so it never fires in practice.
+  const keepAlive = setInterval(() => {}, 60 * 60 * 1000)
   let result
   try {
     result = await supervisor.run(runOptions)

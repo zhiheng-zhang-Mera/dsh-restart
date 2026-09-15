@@ -169,6 +169,13 @@
           # outlive the process it watches. Risk: setting it false makes the
           # supervisor a child that dies with its parent, which defeats the point.
           detach: true
+          # Minimum gap between two relaunch attempts. A launch that fails once usually
+          # fails again immediately, and retrying on every poll tick is how a supervisor
+          # becomes a fork bomb. Risk: too small and a doomed launch is retried in a
+          # tight loop; too large and a recoverable crash takes a minute to recover.
+          relaunchBackoffMs: 2000
+          # Ceiling of the doubling backoff above.
+          relaunchBackoffMaxMs: 60000
 
         # Where durable state lives.
         storage:

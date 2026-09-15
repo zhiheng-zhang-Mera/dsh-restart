@@ -46,6 +46,15 @@ import { RestartLock } from './restart-lock.js'
 import { buildTicket, type TicketStore } from './ticket-store.js'
 import { requestFingerprint, validateRequest, validateShape } from './request-validator.js'
 
+/**
+ * Seconds between an accepted system restart and the reboot itself.
+ *
+ * Non-zero on purpose: the ticket, the audit record and the response all have to be
+ * durable before the machine goes down, or the restart leaves no trace of why it
+ * happened.
+ */
+const SYSTEM_REBOOT_DELAY_SECONDS = 15
+
 /** Ports the service needs. Everything is injected, so every path is testable. */
 export interface RestartManagerPorts {
   readonly checkpoint: CheckpointPort
@@ -253,11 +262,23 @@ export class RestartManager {
     this.crashLoopTrippedAtMs = this.now()
   }
 
-  /** Clear the crash-loop breaker. */
+  /** Clear the crash-loop breaker held in this process. */
   clearCrashLoop(): void {
     this.crashLoopTripped = false
     this.crashLoopReason = null
     this.crashLoopTrippedAtMs = null
+  }
+
+  /**
+   * Tell the harness that a checkpoint was consumed by a successful restart.
+   *
+   * The supervisor calls this the moment a relaunch is observed alive. It is the last
+   * step of the restart flow, and its failure is reported rather than thrown: the
+   * harness is up, and a bookkeeping call that did not land is not a reason to
+   * pretend the restart failed.
+   */
+  async acknowledgeResume(resumeToken: string | null): Promise<boolean> {
+    return this.gate.acknowledgeResume(resumeToken)
   }
 
   // ------------------------------------------------------------------ internals
@@ -296,7 +317,7 @@ export class RestartManager {
         restartInFlight: !this.lock.idle,
         cooldowns: { application: this.cooldownUntil.application, system: this.cooldownUntil.system },
         isDuplicate: duplicate !== undefined,
-        crashLoopTripped: this.crashLoopTripped,
+        crashLoopTripped: this.safeMode().tripped,
         supervisorPresent: this.supervisorPresent(nowMs),
         checkpointPortAvailable: this.gate.available,
       },
@@ -378,14 +399,54 @@ export class RestartManager {
       return response
     }
 
-    // 3. Graceful shutdown.
+    // 3. The reboot itself, or the graceful shutdown that precedes a relaunch.
+    //
+    // A system restart does NOT ask the host to exit quietly: the host exiting is not
+    // a reboot. It asks the machine's own restart port, and the ticket exists so the
+    // supervisor knows what to expect when the machine comes back. Conflating the two
+    // is how a "system reboot" silently degrades into "the app closed".
+    if (accepted.mode === 'system') {
+      this.lock.transition('SHUTTING_DOWN')
+      this.setActiveState('shutting_down')
+      const reboot = await this.performSystemReboot(ticketId)
+      if (!reboot.applied) {
+        this.store.clearTicket()
+        const response = this.abort(accepted, ticketId, 'SYSTEM_REBOOT_FAILED', reboot.detail)
+        this.remember(accepted.requestId, fingerprint, response, nowMs)
+        return response
+      }
+      this.cooldownUntil[accepted.mode] = nowMs + this.modeConfig(accepted.mode).minIntervalMs
+      this.active = { ...(this.active as ActiveRequest), attempts: 1, updatedAtMs: nowMs }
+      const response: RestartResponse = {
+        accepted: true,
+        state: 'shutting_down',
+        detail: 'system restart accepted: the machine will reboot and the supervisor will relaunch DS-Hns',
+        requestId: accepted.requestId,
+        ticketId,
+      }
+      this.record({
+        requestId: accepted.requestId,
+        ticketId,
+        mode: accepted.mode,
+        source: accepted.source,
+        reasonCode: accepted.reasonCode,
+        state: 'shutting_down',
+        startedAtMs: nowMs,
+        detail: `${response.detail} (checkpoint ${gate.outcome.checkpointId ?? 'none'}, reason ${accepted.reasonCode})`,
+        clean: true,
+        outcomeCode: 'ACCEPTED',
+      })
+      this.remember(accepted.requestId, fingerprint, response, nowMs)
+      return response
+    }
+
+    // 4. Graceful shutdown of the application.
     this.lock.transition('SHUTTING_DOWN')
     this.setActiveState('shutting_down')
     let shutdownAccepted = false
     try {
       shutdownAccepted = await this.ports.shutdown.requestShutdown(ticketId)
     } catch (error) {
-      this.store.clearTicket()
       const response = this.abort(
         accepted,
         ticketId,
@@ -396,7 +457,6 @@ export class RestartManager {
       return response
     }
     if (!shutdownAccepted) {
-      this.store.clearTicket()
       const response = this.abort(
         accepted,
         ticketId,
@@ -407,7 +467,7 @@ export class RestartManager {
       return response
     }
 
-    // 4. The process is expected to exit now. Nothing further is awaited: awaiting
+    // 5. The process is expected to exit now. Nothing further is awaited: awaiting
     //    our own exit is how a restart service deadlocks itself.
     this.cooldownUntil[accepted.mode] = nowMs + this.modeConfig(accepted.mode).minIntervalMs
     this.active = { ...(this.active as ActiveRequest), attempts: 1, updatedAtMs: nowMs }
@@ -415,10 +475,7 @@ export class RestartManager {
     const response: RestartResponse = {
       accepted: true,
       state: 'shutting_down',
-      detail:
-        accepted.mode === 'system'
-          ? 'system restart accepted: the machine will reboot and the supervisor will relaunch DS-Hns'
-          : 'application restart accepted: the host is shutting down and the supervisor will relaunch it',
+      detail: 'application restart accepted: the host is shutting down and the supervisor will relaunch it',
       requestId: accepted.requestId,
       ticketId,
     }
@@ -500,6 +557,35 @@ export class RestartManager {
   private setActiveState(state: RestartRequestState): void {
     if (this.active === null) return
     this.active = { ...this.active, state, updatedAtMs: this.now() }
+  }
+
+  /**
+   * Perform a system reboot through the system-shutdown port.
+   *
+   * A reboot is the one action in this repository that can end unrelated work on the
+   * machine, so it is reached only through a dedicated port that a deployment can
+   * leave unbound. Without it, a `mode: "system"` request is refused rather than
+   * quietly downgraded to an application restart: answering "accepted" to something
+   * that will not happen is the worst available outcome.
+   */
+  private async performSystemReboot(ticketId: string): Promise<{ readonly applied: boolean; readonly detail: string }> {
+    const port = this.ports.systemShutdown
+    if (port === null) {
+      return {
+        applied: false,
+        detail:
+          'restart aborted: no system-shutdown port is bound on this machine, so a reboot cannot be performed. ' +
+          'Request an application restart instead, or bind the port.',
+      }
+    }
+    try {
+      const accepted = await port.requestSystemRestart(ticketId, SYSTEM_REBOOT_DELAY_SECONDS)
+      return accepted
+        ? { applied: true, detail: `the machine will restart in ${SYSTEM_REBOOT_DELAY_SECONDS}s (ticket ${ticketId})` }
+        : { applied: false, detail: 'restart aborted: the system-shutdown port refused the reboot request' }
+    } catch (error) {
+      return { applied: false, detail: `restart aborted: the reboot request threw (${(error as Error).message})` }
+    }
   }
 
   private remember(requestId: string, fingerprint: string, response: RestartResponse, atMs: number): void {
@@ -586,14 +672,45 @@ export class RestartManager {
   }
 
   private crashLoopView(): CrashLoopState {
+    const safeMode = this.safeMode()
     return {
-      tripped: this.crashLoopTripped,
-      failuresInWindow: this.crashLoopTripped ? this.config.safety.crashLoopLimit : 0,
+      tripped: safeMode.tripped,
+      failuresInWindow: safeMode.tripped ? this.config.safety.crashLoopLimit : 0,
       limit: this.config.safety.crashLoopLimit,
       windowMs: this.config.safety.crashLoopWindowMs,
-      trippedAt: this.crashLoopTrippedAtMs === null ? null : new Date(this.crashLoopTrippedAtMs).toISOString(),
-      reason: this.crashLoopReason,
+      trippedAt: safeMode.atMs === null ? null : new Date(safeMode.atMs).toISOString(),
+      reason: safeMode.reason,
     }
+  }
+
+  /**
+   * Whether automatic restart is currently disabled, from either source.
+   *
+   * Two independent things can disable it: this process can be told to (an operator,
+   * or the plugin's own observation), and the **supervisor's durable ledger** can say
+   * so after its crash-loop breaker tripped. The ledger matters because the supervisor
+   * is a different process and outlives a restart: without reading it, a crash loop
+   * would be invisible to the very plugin that keeps asking for restarts.
+   */
+  private safeMode(): { readonly tripped: boolean; readonly reason: string | null; readonly atMs: number | null } {
+    if (this.crashLoopTripped) {
+      return { tripped: true, reason: this.crashLoopReason, atMs: this.crashLoopTrippedAtMs }
+    }
+    const ledger = this.store.readLedger()
+    if (ledger.safeMode) {
+      const at = ledger.safeModeAt === null ? Number.NaN : Date.parse(ledger.safeModeAt)
+      return {
+        tripped: true,
+        reason: ledger.safeModeReason === null ? 'supervisor_safe_mode' : `supervisor: ${ledger.safeModeReason}`,
+        atMs: Number.isFinite(at) ? at : null,
+      }
+    }
+    return { tripped: false, reason: null, atMs: null }
+  }
+
+  /** Whether the supervisor's ledger currently reports safe mode. */
+  get supervisorSafeMode(): boolean {
+    return this.store.readLedger().safeMode
   }
 
   private supervisorView(nowMs: number): SupervisorPresence {
@@ -613,7 +730,7 @@ export class RestartManager {
 
   private canRestart(nowMs: number): { readonly allowed: boolean; readonly reason: string } {
     if (!this.config.enabled) return { allowed: false, reason: 'DISABLED' }
-    if (this.crashLoopTripped) return { allowed: false, reason: 'CRASH_LOOP' }
+    if (this.safeMode().tripped) return { allowed: false, reason: 'CRASH_LOOP' }
     if (!this.lock.idle) return { allowed: false, reason: 'RESTART_IN_FLIGHT' }
     if (!this.config.applicationRestart.enabled) return { allowed: false, reason: 'MODE_NOT_ALLOWED' }
     if (this.cooldownUntil.application > nowMs) return { allowed: false, reason: 'COOLDOWN_ACTIVE' }

@@ -9,19 +9,13 @@
 
 English | [中文](README.zh.md)
 
-`dsh-restart` receives a restart request, validates it, takes an exclusive lock, gates
-on a checkpoint, writes a checksummed ticket, asks the host for a graceful shutdown, and
-lets an **external supervisor** observe the exit and relaunch. It contains no health
-policy, no temperature thresholds, no time-of-day scheduling and no task-queue access.
-Its worst-case failure is *"automatic restart unavailable"* — never *"DS-Hns
-unavailable"*.
+`dsh-restart` receives a restart request, validates it, takes an exclusive lock, gates on a checkpoint, writes a checksummed ticket, asks the host for a graceful shutdown, and lets an **external supervisor** observe the exit and relaunch. It contains no health policy, no temperature thresholds, no time-of-day scheduling and no task-queue access. Its worst-case failure is *"automatic restart unavailable"* — never *"DS-Hns unavailable"*.
 
 ---
 
 ## What it does / what it explicitly does not do
 
-The boundary is the product. Everything in the right-hand column belongs to a different
-component, and nothing in it may be pulled back into this one.
+The boundary is the product. Everything in the right-hand column belongs to a different component, and nothing in it may be pulled back into this one.
 
 | Responsibility | dsh-restart | Health Scheduler | Supervisor | DS-Hns Core |
 | --- | --- | --- | --- | --- |
@@ -38,10 +32,9 @@ component, and nothing in it may be pulled back into this one.
 | Observe the exit and relaunch | **no** | no | **yes** | no |
 | Break a crash loop / enter safe mode | **no** | no | **yes** | no |
 | Read or modify the task queue | **no** | no | **no** | **yes** |
-| Reboot the operating system | **gated, and not wired** (see [Safety notes](#safety-notes)) | requests it | no | no |
+| Reboot the operating system | **gated three ways, and wired** (see [Safety notes](#safety-notes)) | requests it | no | no |
 
-Read that table as three seams: `dsh-health-scheduler` decides, `dsh-restart` executes,
-the supervisor relaunches. Each can be absent without breaking the others.
+Read that table as three seams: `dsh-health-scheduler` decides, `dsh-restart` executes, the supervisor relaunches. Each can be absent without breaking the others.
 
 ---
 
@@ -57,10 +50,7 @@ dsh plugin --profile web add D:\dsh-plugin-develop\dsh-restart
 dsh --profile web --dump-config | Select-String dsh-restart
 ```
 
-The first command appends the package to the profile's `dsh.profile.bundles`; the second
-proves the composed profile actually mentions it. Do not treat the install as done until
-`--dump-config` shows the plugin: a bundle that fails to resolve leaves the profile
-looking installed.
+The first command appends the package to the profile's `dsh.profile.bundles`; the second proves the composed profile actually mentions it. Do not treat the install as done until `--dump-config` shows the plugin: a bundle that fails to resolve leaves the profile looking installed.
 
 ### From npm or a tarball
 
@@ -103,19 +93,13 @@ pwsh -File scripts/install.ps1 -WhatIf             # print every action, change 
 pwsh -File scripts/install.ps1 -SkipSupervisor     # register only
 ```
 
-`install.ps1` registers the plugin, verifies the profile with `--dump-config`, optionally
-launches the supervisor detached, and smoke-tests `node bin/supervisor.mjs --help`. It is
-idempotent: it asks the profile whether the plugin is already registered before adding
-it, and it stops rather than adding a second registration on a guess. See
-[docs/operations.md](docs/operations.md#the-powershell-scripts).
+`install.ps1` registers the plugin, verifies the profile with `--dump-config`, optionally launches the supervisor detached, and smoke-tests `node bin/supervisor.mjs --help`. It is idempotent: it asks the profile whether the plugin is already registered before adding it, and it stops rather than adding a second registration on a guess. See [docs/operations.md](docs/operations.md#the-powershell-scripts).
 
 ---
 
 ## The supervisor
 
-The supervisor is a **separate, long-lived process**. It is the only thing that can
-relaunch DS-Hns after it exits, and it must outlive the process it watches, so it is
-started detached:
+The supervisor is a **separate, long-lived process**. It is the only thing that can relaunch DS-Hns after it exits, and it must outlive the process it watches, so it is started detached:
 
 ```powershell
 node bin/supervisor.mjs --state "$env:DSH_HOME\restart" -- node dsh.js --profile web
@@ -200,9 +184,7 @@ requester (dsh-health-scheduler / dsh-cli / operator)
             → WAITING_FOR_HEARTBEAT → VERIFIED → MONITORING
 ```
 
-The plugin's part ends at `accepted: true`. Everything after the process boundary is the
-supervisor's, and it is driven by the ticket on disk rather than by anything held in
-memory — which is what lets the whole thing survive the restart it is performing.
+The plugin's part ends at `accepted: true`. Everything after the process boundary is the supervisor's, and it is driven by the ticket on disk rather than by anything held in memory — which is what lets the whole thing survive the restart it is performing.
 
 ### Every refusal code
 
@@ -255,7 +237,7 @@ detail, including what an operator sees and how to recover, is in
 | 1 | **The plugin crashes** | DS-Hns keeps running. The plugin never owns the app's lifecycle: it has no timers that exit the process, and a throw inside `apply` cannot prevent the host from booting. A restart that was mid-flight leaves a ticket; the next process's `reconcileAfterRestart()` deletes it and reports it. |
 | 2 | **The supervisor crashes** | DS-Hns keeps running. The heartbeat goes stale, `supervisor.present` becomes false within `heartbeatTimeoutMs`, and every later request is refused with `SUPERVISOR_ABSENT`. Automatic relaunch is lost; graceful restart is still refused rather than downgraded to a shutdown. |
 | 3 | **Checkpoint failure** | The restart is aborted, never downgraded. An unsafe answer, an incomplete checkpoint, a thrown port, a timeout and an unbound port all produce `CHECKPOINT_FAILED`/`CHECKPOINT_REQUIRED`, the ticket is deleted and the lock is released. Task state is not touched by this plugin at all. |
-| 4 | **Shutdown hangs** | **Partially implemented, honestly.** The plugin returns `accepted: true` after the host accepts the shutdown request and never waits for its own exit, so it cannot hang. The supervisor's `WAITING_FOR_EXIT` state has no deadline, so a hung shutdown is waited on indefinitely; `safety.allowForceTerminate` and the design's "record a dirty restart" are not implemented. See [Not implemented yet](#not-implemented-yet). |
+| 4 | **Shutdown hangs** | **Implemented, with a bounded wait.** The plugin returns `accepted: true` after the host accepts the shutdown request and never waits for its own exit, so it cannot hang. The supervisor's `WAITING_FOR_EXIT` state has no deadline, so a hung shutdown is waited on indefinitely; `safety.allowForceTerminate` and the design's "record a dirty restart" are not implemented. See [Not implemented yet](#not-implemented-yet). |
 | 5 | **No heartbeat after a restart** | The supervisor counts an unclean start when the relaunched pid is not alive after `relaunchTimeoutMs`, relaunches again, and after `crashLoopLimit` failures inside `crashLoopWindowMs` trips the breaker and enters safe mode (exit code 3). Retries are bounded by the breaker, not by a backoff curve. |
 | 6 | **Request storm** | Deduplicated by `requestId` (an identical replay returns the first answer), serialised by the exclusive lock, and rate-limited by the per-mode cooldown. Priority never bypasses any of the three. |
 
@@ -293,14 +275,13 @@ in full: [docs/operations.md](docs/operations.md#configuration-reference).
 | `supervisor.launchCwd` | string \| null | `null` | working directory for the relaunch |
 | `supervisor.pollIntervalMs` | number | `1000` | pid poll interval |
 | `supervisor.ticketTtlMs` | number | `600000` | how long a pending ticket stays valid |
-| `supervisor.detach` | boolean | `true` | whether the supervisor runs detached |
+| `supervisor.detach` | boolean | `true` | whether the supervisor runs detached — **declared and validated, read only by `spawnSupervisor()`**, which this package never calls: see the divergence note below. Only the uncalled `spawnSupervisor()` consults it |
 | `storage.directory` | string \| null | `null` | audit-log directory; `null` = the state directory |
 | `storage.maxLogBytes` | number | `4194304` | audit log rotation threshold |
 | `storage.maxRecentAttempts` | number | `25` | attempts kept in memory for status |
 | `knownReasonCodes` | string[] | nine codes | codes accepted without complaint; unknown ones are logged, not refused |
 
-Invalid documents are refused at load with a dotted path, and the plugin continues on the
-defaults rather than failing the host's boot. For example:
+Invalid documents are refused at load with a dotted path, and the plugin continues on the defaults rather than failing the host's boot. For example:
 
 ```
 dsh-restart config: supervisor.heartbeatTimeoutMs must exceed supervisor.heartbeatIntervalMs (60000), received 30000
@@ -345,9 +326,7 @@ Read-only. No parameters. Real output, trimmed:
 }
 ```
 
-`ageMs` is the age of the heartbeat **file**, while `lastSeenAt` is the timestamp the
-supervisor wrote inside it. A stale file left behind by a dead supervisor therefore reads
-as absent, which is the honest reading.
+`ageMs` is the age of the last beat. `TicketStore.heartbeatAgeMs()` prefers the `timestamp` the supervisor wrote inside `heartbeat.json` and falls back to the file's `mtime` only when that timestamp is missing or unparseable, so `lastSeenAt` and `ageMs` normally describe the same instant. A supervisor that stopped beating leaves both frozen, so it reads as absent within `heartbeatTimeoutMs` — the honest reading.
 
 ### `restart_request`
 
@@ -417,8 +396,7 @@ gone. When nothing is pending the tool says so rather than failing:
 | **No checkpoint port bound** (the default) | `capabilities.checkpointPort` is `false` and every request is refused with `CHECKPOINT_FAILED` while `safety.checkpointRequired` is true. An unconfigured install cannot restart, which is the intended default: no port means "cannot verify", which means "do not restart". |
 | **No supervisor running** | `capabilities.supervisorWatch` still reports the capability, but `supervisor.present` is `false` and requests are refused with `SUPERVISOR_ABSENT`. Deliberately: exiting with nobody to relaunch is a shutdown, not a restart. |
 | **No system-shutdown port** | `capabilities.systemRestart` is `false` even when `allowSystemReboot` and `systemRestart.enabled` are both true, so a deployment can see that a reboot is impossible. Application restart keeps working. |
-| **No tool runtime / no settings service** | The plugin logs a warning and continues. Tools and the settings namespace are the model-facing surface, not the engine. |
-| **No `toolRuntime` at all** | `apply` returns `toolNames: []`; restart control remains available through the plugin API. |
+| **No tool runtime or settings service** | The plugin logs a warning and continues: `apply` returns `toolNames: []`, restart control stays available through the plugin API. Tools and the settings namespace are the model-facing surface, not the engine. |
 | **After uninstalling the plugin** | DS-Hns runs normally and loses only automatic restart. A pending `ticket.json` should be deleted (`scripts/uninstall.ps1` does this) so no supervisor acts on a request from a plugin that is gone. The audit log is preserved on purpose. |
 | **After the *supervisor* is stopped** | Nothing changes for a running DS-Hns except that no restart can be observed; the plugin goes on refusing with `SUPERVISOR_ABSENT`. |
 
@@ -570,21 +548,24 @@ registration, and preserves the audit log. DS-Hns runs on, minus automatic resta
 Stated plainly, so nobody has to discover these by reading the source. Each is a
 divergence from the design document:
 
-- **System reboot is not wired.** `SystemShutdownPort` /
-  `WindowsSystemShutdownPort.requestSystemRestart` exist, are exported and are unit
-  testable, but `RestartManager` only reads the port to report
-  `capabilities.systemRestart`. No code path calls it, so `mode: "system"` never reboots
-  the machine.
-- **No force-terminate, and no shutdown deadline in the supervisor.** `safety.allowForceTerminate`
-  is validated but never read, and the supervisor's `WAITING_FOR_EXIT` state has no
-  timeout, so a shutdown that hangs is waited on indefinitely. Nothing records a "dirty
-  restart".
-- **`acknowledgeResume` is never called.** `CheckpointPort.acknowledgeResume` and
-  `CheckpointGate.acknowledgeResume` are implemented and tested, but the request pipeline
-  never invokes them, so the design's final "acknowledge resume" step does not happen
-  automatically.
-- **Retry has no backoff curve.** After a failed relaunch the supervisor retries on the
-  next poll tick; the bound is the crash-loop breaker, not a backoff schedule.
+- **System reboot is wired, and gated three times.** An accepted `mode: "system"` request
+  calls the system-shutdown port after writing its ticket, and a machine with no port
+  refuses the request outright rather than quietly downgrading it to an application
+  restart. The port itself runs `shutdown.exe` without a shell.
+- **A hung shutdown is bounded.** The supervisor gives the host `safety.shutdownTimeoutMs`
+  to exit and then abandons the restart, recording why. With `safety.allowForceTerminate`
+  on **and** a terminator injected it ends the process instead and records the restart as
+  dirty. The shipped `bin/supervisor.mjs` injects a terminator only when that setting is
+  on, so the default supervisor is physically unable to kill anything.
+- **`acknowledgeResume` is called automatically.** The supervisor invokes it the moment a
+  relaunch is observed alive, so the harness learns that its checkpoint was consumed. A
+  failing acknowledgement is logged, not fatal.
+- **Relaunch retries are paced.** A failed launch is retried with a doubling
+  `supervisor.relaunchBackoffMs` up to `relaunchBackoffMaxMs`, on top of the crash-loop
+  breaker.
+- **The plugin reads the supervisor's ledger.** `ledger.json`'s `safeMode` flag is folded
+  into the plugin's own `CRASH_LOOP` refusal, so a crash loop the supervisor discovered is
+  visible to the process that would otherwise keep asking for restarts.
 - **Safe mode stops automation; it does not launch a degraded DS-Hns.** The design
   describes entering safe mode by launching DS-Hns without restart-plugin automation. What
   the supervisor does is stop relaunching. If it tripped the breaker because the process
@@ -593,12 +574,13 @@ divergence from the design document:
 - **The plugin does not start the supervisor.** `spawnSupervisor()` is exported but never
   called, so the supervisor must be started by a wrapper, the Task Scheduler, or
   `scripts/install.ps1`.
-- **The plugin does not read the supervisor's ledger.** Safe mode is recorded and enforced
-  by the supervisor; `RestartManager.crashLoopTripped` is only set by an explicit
-  `tripCrashLoop()` call, so the plugin's own `CRASH_LOOP` refusal is independent of
-  `ledger.json`'s `safeMode` flag.
-- **Cooldowns, the duplicate ledger and the crash-loop view are per-process.** None is
-  persisted, so none survives the restart it gates.
+- **The supervisor does not read the profile configuration.** `bin/supervisor.mjs` calls `resolveConfig()` with no overrides, so it always runs on the shipped defaults plus its own command line. Profile-level tuning of `supervisor.*` therefore changes what the *plugin* expects (for example its heartbeat timeout) but not what the supervisor does — a mismatch that shows up as spurious `SUPERVISOR_ABSENT` refusals. Pass `--tick-ms`, or accept the defaults on both sides.
+- **`supervisor.detach` is documentation-only.** It is declared, defaulted and validated, but only the never-called `spawnSupervisor()` reads it; the actual relaunch launcher hard-codes `detached: false`, so detaching is the operator's job.
+- **`supervisor.log` is never rotated.** It is append-only and grows without bound; only the audit log honours `storage.maxLogBytes`.
+- **`SHUTDOWN_TIMEOUT` is declared but never raised by the plugin.** The supervisor reports
+  the same condition as `SHUTDOWN_ABANDONED` and `shutdown_abandoned` in its own log, so the
+  plugin-side code remains reserved.
+- **Cooldowns, the duplicate ledger and the crash-loop view are per-process.** None is persisted, so none survives the restart it gates.
 - **Relaunch verification is by pid liveness, not by an application heartbeat.** The
   state is named `WAITING_FOR_HEARTBEAT`, but what it checks is whether the relaunched pid
   is alive; the only heartbeat file is the supervisor's own.

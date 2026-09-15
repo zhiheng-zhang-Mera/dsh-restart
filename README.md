@@ -34,7 +34,7 @@ The boundary is the product. Everything in the right-hand column belongs to a di
 | Read or modify the task queue | **no** | no | **no** | **yes** |
 | Reboot the operating system | **gated three ways, and wired** (see [Safety notes](#safety-notes)) | requests it | no | no |
 
-Read that table as three seams: `dsh-health-scheduler` decides, `dsh-restart` executes, the supervisor relaunches. Each can be absent without breaking the others.
+Read that table as three seams: [`dsh-health-scheduler`](https://github.com/zhiheng-zhang-Mera/dsh-health-scheduler) decides, `dsh-restart` executes, the supervisor relaunches. Each can be absent without breaking the others.
 
 ---
 

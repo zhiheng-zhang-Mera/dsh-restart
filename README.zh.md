@@ -34,7 +34,7 @@ English | [中文](README.zh.md)
 | 读取或修改任务队列 | **否** | 否 | **否** | **是** |
 | 重启操作系统 | **三重门禁且已接线**（见[安全说明](#安全说明)） | 请求重启 | 否 | 否 |
 
-把这张表读作三道接缝：`dsh-health-scheduler` 做决定，`dsh-restart` 执行，Supervisor 负责重新拉起。任何一方缺席都不会破坏另外两方。
+把这张表读作三道接缝：[`dsh-health-scheduler`](https://github.com/zhiheng-zhang-Mera/dsh-health-scheduler) 做决定，`dsh-restart` 执行，Supervisor 负责重新拉起。任何一方缺席都不会破坏另外两方。
 
 ---
 
